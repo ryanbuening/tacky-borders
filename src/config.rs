@@ -107,7 +107,7 @@ pub fn serde_default_bool<const V: bool>() -> bool {
     V
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowRule {
     #[serde(rename = "match")]
@@ -129,6 +129,42 @@ pub struct WindowRule {
     #[serde(alias = "restore_delay")]
     pub unminimize_delay: Option<u64>,
     pub enabled: Option<EnableMode>,
+    #[serde(skip)]
+    pub regex: Option<regex::Regex>,
+}
+
+impl WindowRule {
+    pub fn init(&mut self) {
+        if self.strategy == Some(MatchStrategy::Regex)
+            && let Some(ref name) = self.name
+        {
+            match regex::Regex::new(name) {
+                Ok(re) => self.regex = Some(re),
+                Err(err) => error!("invalid regex pattern '{name}' in window rule: {err:#}"),
+            }
+        }
+    }
+}
+
+impl PartialEq for WindowRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.name == other.name
+            && self.strategy == other.strategy
+            && self.border_width == other.border_width
+            && self.border_offset == other.border_offset
+            && self.border_radius == other.border_radius
+            && self.border_z_order == other.border_z_order
+            && self.follow_native_border == other.follow_native_border
+            && self.active_color == other.active_color
+            && self.inactive_color == other.inactive_color
+            && self.komorebi_colors == other.komorebi_colors
+            && self.animations == other.animations
+            && self.effects == other.effects
+            && self.initialize_delay == other.initialize_delay
+            && self.unminimize_delay == other.unminimize_delay
+            && self.enabled == other.enabled
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -157,7 +193,7 @@ impl WidthConfig {
     // TODO: Maybe rename this and other to_x methods to to_raw or smth idk
     /// Returns a DPI-adjusted raw width value
     pub fn to_width(&self, dpi: f32) -> i32 {
-        (self.0 as f32 * dpi / 96.0).round() as i32
+        (self.0 * dpi / 96.0).round() as i32
     }
 
     fn serde_default() -> Self {
@@ -319,7 +355,11 @@ impl Config {
         }
 
         // Deserialize the config.yaml file
-        serde_yaml_ng::from_str(&contents).map_err(anyhow::Error::new)
+        let mut config: Config = serde_yaml_ng::from_str(&contents).map_err(anyhow::Error::new)?;
+        for rule in &mut config.window_rules {
+            rule.init();
+        }
+        Ok(config)
     }
 
     pub fn get_dir() -> anyhow::Result<PathBuf> {
@@ -397,11 +437,11 @@ impl Config {
             || self.window_rules.iter().any(|rule| {
                 rule.active_color
                     .as_ref()
-                    .map_or(false, Self::is_color_theme_aware)
+                    .is_some_and(Self::is_color_theme_aware)
                     || rule
                         .inactive_color
                         .as_ref()
-                        .map_or(false, Self::is_color_theme_aware)
+                        .is_some_and(Self::is_color_theme_aware)
             })
     }
 

@@ -18,28 +18,28 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Diagnostics::Debug::FACILITY_ITF;
 use windows::Win32::System::Registry::{HKEY, RegCloseKey};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, GetDpiForMonitor, MONITOR_DPI_TYPE, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetMessageW,
-    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
-    IsWindowVisible, MSG, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_NCDESTROY, WS_CHILD,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
+    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
 use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
 use crate::event_hook::handle_foreground_event;
-use crate::window_border::WindowBorder;
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
@@ -55,6 +55,7 @@ pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
 pub const WM_APP_SET_WIDTH: u32 = WM_APP + 11;
 pub const WM_APP_SET_OFFSET: u32 = WM_APP + 12;
 pub const WM_APP_SET_RADIUS: u32 = WM_APP + 13;
+pub const WM_APP_CREATE_BORDER: u32 = WM_APP + 14;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs
@@ -391,6 +392,60 @@ impl Drop for OwnedHANDLE {
     }
 }
 
+pub fn is_current_process_elevated() -> anyhow::Result<bool> {
+    is_process_handle_elevated(unsafe { GetCurrentProcess() })
+        .context("could not query current process elevation")
+}
+
+pub fn is_process_elevated(process_id: u32) -> anyhow::Result<bool> {
+    let process = OwnedHANDLE(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .with_context(|| format!("could not open process {process_id}"))?,
+    );
+
+    is_process_handle_elevated(process.0)
+        .with_context(|| format!("could not query elevation for process {process_id}"))
+}
+
+fn is_process_handle_elevated(process: HANDLE) -> anyhow::Result<bool> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .context("could not open process token")?;
+    let token = OwnedHANDLE(token);
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned_size = 0;
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some(ptr::addr_of_mut!(elevation).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned_size,
+        )
+    }
+    .context("could not read process token elevation")?;
+
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+pub static CURRENT_PROCESS_ELEVATED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| is_current_process_elevated().unwrap_or(false));
+
+pub fn can_access_window(hwnd: HWND) -> bool {
+    if *CURRENT_PROCESS_ELEVATED {
+        return true;
+    }
+    let mut process_id = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) } == 0 {
+        return false;
+    }
+    match is_process_elevated(process_id) {
+        Ok(is_elevated) => !is_elevated,
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct OwnedHKEY(pub HKEY);
 
@@ -410,9 +465,11 @@ pub struct OwnedHWND(pub HWND);
 
 impl Drop for OwnedHWND {
     fn drop(&mut self) {
-        unsafe { DestroyWindow(self.0) }
-            .with_context(|| format!("could not destroy window for {:?}", self.0))
-            .log_if_err();
+        if !self.0.is_invalid() && !self.0.0.is_null() {
+            unsafe { DestroyWindow(self.0) }
+                .with_context(|| format!("could not destroy window for {:?}", self.0))
+                .log_if_err();
+        }
     }
 }
 
@@ -439,8 +496,13 @@ pub fn has_filtered_style(hwnd: HWND) -> bool {
 pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
     let mut title_buf: [u16; 256] = [0; 256];
 
+    // A zero return value can mean either an empty title or an actual failure. GetWindowTextW does
+    // not clear LastError on success, so clear it first to avoid reporting an unrelated earlier
+    // error (for example ERROR_MOD_NOT_FOUND) as the cause of an empty title.
+    unsafe { SetLastError(ERROR_SUCCESS) };
     if unsafe { GetWindowTextW(hwnd, &mut title_buf) } == 0 {
         let last_error = get_last_error();
+        unsafe { SetLastError(ERROR_SUCCESS) };
 
         // ERROR_ENVVAR_NOT_FOUND just means the title is empty which isn't necessarily an issue
         // TODO: figure out whats with the invalid window handles
@@ -448,8 +510,6 @@ pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
             last_error,
             ERROR_ENVVAR_NOT_FOUND | ERROR_SUCCESS | ERROR_INVALID_WINDOW_HANDLE
         ) {
-            // We manually reset LastError here because it doesn't seem to reset by itself
-            unsafe { SetLastError(ERROR_SUCCESS) };
             return Err(anyhow!("{last_error:?}"));
         }
     }
@@ -461,8 +521,10 @@ pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
 pub fn get_window_class(hwnd: HWND) -> anyhow::Result<String> {
     let mut class_buf: [u16; 256] = [0; 256];
 
+    unsafe { SetLastError(ERROR_SUCCESS) };
     if unsafe { RealGetWindowClassW(hwnd, &mut class_buf) } == 0 {
         let last_error = get_last_error();
+        unsafe { SetLastError(ERROR_SUCCESS) };
 
         // ERROR_ENVVAR_NOT_FOUND just means the title is empty which isn't necessarily an issue
         // TODO: figure out whats with the invalid window handles
@@ -470,8 +532,6 @@ pub fn get_window_class(hwnd: HWND) -> anyhow::Result<String> {
             last_error,
             ERROR_ENVVAR_NOT_FOUND | ERROR_SUCCESS | ERROR_INVALID_WINDOW_HANDLE
         ) {
-            // We manually reset LastError here because it doesn't seem to reset by itself
-            unsafe { SetLastError(ERROR_SUCCESS) };
             return Err(anyhow!("{last_error:?}"));
         }
     }
@@ -571,16 +631,21 @@ pub fn get_window_rule(hwnd: HWND) -> WindowRule {
 
         // Check if the window rule matches the window
         let has_match = match rule.strategy {
-            Some(MatchStrategy::Equals) | None => {
-                window_name.to_lowercase().eq(&match_name.to_lowercase())
+            Some(MatchStrategy::Equals) | None => window_name.eq_ignore_ascii_case(match_name),
+            Some(MatchStrategy::Contains) => {
+                let window_lower = window_name.to_lowercase();
+                let match_lower = match_name.to_lowercase();
+                window_lower.contains(&match_lower)
             }
-            Some(MatchStrategy::Contains) => window_name
-                .to_lowercase()
-                .contains(&match_name.to_lowercase()),
-            Some(MatchStrategy::Regex) => Regex::new(match_name)
-                .unwrap()
-                .captures(window_name)
-                .is_some(),
+            Some(MatchStrategy::Regex) => {
+                if let Some(ref re) = rule.regex {
+                    re.is_match(window_name)
+                } else {
+                    Regex::new(match_name)
+                        .map(|re| re.is_match(window_name))
+                        .unwrap_or(false)
+                }
+            }
         };
 
         // Return the first match
@@ -681,60 +746,7 @@ pub fn has_native_border(hwnd: HWND) -> bool {
 }
 
 pub fn create_border_for_window(tracking_window: HWND, window_rule: WindowRule) {
-    let tracking_window_isize = tracking_window.0 as isize;
-
-    let _ = thread::spawn(move || {
-        let tracking_window = HWND(tracking_window_isize as _);
-
-        // Note: 'key' for the hashmap is the tracking window, 'value' is the border window
-        let mut borders_hashmap = APP_STATE.borders.lock().unwrap();
-
-        // Check to see if there is already a border for the given tracking window
-        if borders_hashmap.contains_key(&tracking_window_isize) {
-            return;
-        }
-
-        debug!("creating border for: {tracking_window:?}");
-
-        // Otherwise, continue creating the border window
-        let mut border = match WindowBorder::new(tracking_window) {
-            Ok(border) => border,
-            Err(err) => {
-                error!("could not create window border for {tracking_window:?}: {err:#}");
-                return;
-            }
-        };
-
-        borders_hashmap.insert(tracking_window_isize, border.border_window.0.0 as isize);
-        drop(borders_hashmap);
-
-        // Drop these values (to save some RAM?) before calling init and entering a message loop
-        let _ = tracking_window;
-        let _ = tracking_window_isize;
-
-        if let Err(err) = border.init(window_rule) {
-            error!("could not initialize border: {err:#}");
-        } else {
-            // Window message loop
-            unsafe {
-                let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-        };
-
-        // If the above loop exits, that means the border has been destroyed, so we should remove
-        // it from the hashmap
-        APP_STATE
-            .borders
-            .lock()
-            .unwrap()
-            .remove(&tracking_window_isize);
-
-        debug!("exiting border thread for {:?}!", border.tracking_window);
-    });
+    crate::border_manager::BORDER_MANAGER.create_border(tracking_window, window_rule);
 }
 
 pub fn get_adjusted_radius(radius: f32, dpi: u32, border_width: i32) -> f32 {
@@ -806,17 +818,34 @@ pub fn get_monitor_info(hmonitor: HMONITOR) -> windows::core::Result<MONITORINFO
 }
 
 pub fn destroy_border_for_window(tracking_window: HWND) {
-    if let Some(&border_isize) = APP_STATE
-        .borders
-        .lock()
-        .unwrap()
-        .get(&(tracking_window.0 as isize))
-    {
+    let border_isize = {
+        let borders = APP_STATE.borders.lock().unwrap();
+        borders.get(&(tracking_window.0 as isize)).copied()
+    };
+
+    if let Some(border_isize) = border_isize {
         let border_window = HWND(border_isize as _);
 
-        send_notify_message_w(border_window, WM_NCDESTROY, WPARAM(0), LPARAM(0))
-            .context("destroy_border_for_window")
-            .log_if_err();
+        let mut remove_from_state = false;
+        if !is_window(Some(border_window)) {
+            remove_from_state = true;
+        } else if let Err(err) = post_message_w(
+            Some(border_window),
+            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            WPARAM(0),
+            LPARAM(0),
+        ) {
+            error!("destroy_border_for_window: {err:#}");
+            remove_from_state = true;
+        }
+
+        if remove_from_state {
+            APP_STATE
+                .borders
+                .lock()
+                .unwrap()
+                .remove(&(tracking_window.0 as isize));
+        }
     }
 }
 
@@ -842,10 +871,15 @@ pub fn show_border_for_window(hwnd: HWND) {
             .context("show_border_for_window")
             .log_if_err();
     } else if is_window_top_level(hwnd) && is_window_visible(hwnd) && !is_window_cloaked(hwnd) {
+        if !can_access_window(hwnd) {
+            debug!("skipping inaccessible/elevated window {hwnd:?}");
+            return;
+        }
+
         let window_rule = get_window_rule(hwnd);
 
         if window_rule.enabled == Some(EnableMode::Bool(false)) {
-            info!("border is disabled for {hwnd:?}");
+            debug!("border is disabled for {hwnd:?}");
         } else if window_rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(hwnd) {
             create_border_for_window(hwnd, window_rule);
         }
@@ -853,26 +887,21 @@ pub fn show_border_for_window(hwnd: HWND) {
 }
 
 pub fn hide_border_for_window(hwnd: HWND) {
-    let hwnd_isize = hwnd.0 as isize;
-
-    // Spawn a new thread to guard against re-entrancy in the event hook, though it honestly isn't
-    // that important for our purposes I think
-    let _ = thread::spawn(move || {
-        let hwnd = HWND(hwnd_isize as _);
-
-        if let Some(border) = get_border_for_window(hwnd) {
-            post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
-                .context("hide_border_for_window")
-                .log_if_err();
-        }
-    });
+    if let Some(border) = get_border_for_window(hwnd) {
+        post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
+            .context("hide_border_for_window")
+            .log_if_err();
+    }
 }
 
 /// Spawns a thread that polls to make up for unreliable events (e.g. EVENT_SYSTEM_FOREGROUND).
 pub fn spawn_window_state_poller() {
     const POLL_DELAY: u64 = 100;
+    // Sweep for dead windows every 2000ms (20 ticks of 100ms)
+    const SWEEP_INTERVAL_TICKS: u64 = 20;
 
     let _ = thread::spawn(move || {
+        let mut sweep_counter: u64 = 0;
         loop {
             // Handle any changes in terms of which window is foreground/active
             let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
@@ -881,17 +910,21 @@ pub fn spawn_window_state_poller() {
                 handle_foreground_event(new_active_hwnd, old_active_hwnd);
             }
 
-            // Reap borders for windows that no longer exist
-            let invalid_hwnds: Vec<HWND> = APP_STATE
-                .borders
-                .lock()
-                .unwrap()
-                .keys()
-                .map(|tracking_isize| HWND(*tracking_isize as _))
-                .filter(|tracking_hwnd| !is_window(Some(*tracking_hwnd)))
-                .collect();
-            for hwnd in invalid_hwnds {
-                destroy_border_for_window(hwnd);
+            sweep_counter += 1;
+            if sweep_counter >= SWEEP_INTERVAL_TICKS {
+                sweep_counter = 0;
+                // Reap borders for windows that no longer exist
+                let invalid_hwnds: Vec<HWND> = APP_STATE
+                    .borders
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .map(|tracking_isize| HWND(*tracking_isize as _))
+                    .filter(|tracking_hwnd| !is_window(Some(*tracking_hwnd)))
+                    .collect();
+                for hwnd in invalid_hwnds {
+                    destroy_border_for_window(hwnd);
+                }
             }
 
             thread::sleep(time::Duration::from_millis(POLL_DELAY));
@@ -1018,6 +1051,40 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
+    use windows::Win32::UI::WindowsAndMessaging::CreateWindowExW;
+    use windows::core::w;
+
+    #[test]
+    fn empty_window_title_does_not_reuse_stale_last_error() -> anyhow::Result<()> {
+        let window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!(""),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+
+        unsafe { SetLastError(ERROR_MOD_NOT_FOUND) };
+        assert_eq!(get_window_title(window.0)?, "");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_current_process_elevation_query() {
+        let is_elevated = is_current_process_elevated();
+        assert!(is_elevated.is_ok());
+    }
 
     #[test]
     fn test_cubic_bezier() -> anyhow::Result<()> {

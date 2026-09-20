@@ -1,9 +1,9 @@
 use anyhow::{Context, anyhow};
 use std::ptr;
-use std::thread;
 use std::time;
 use windows::Win32::Foundation::{
-    COLORREF, D2DERR_RECREATE_TARGET, FALSE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+    COLORREF, D2DERR_RECREATE_TARGET, ERROR_ACCESS_DENIED, FALSE, HWND, LPARAM, LRESULT, RECT,
+    TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{D2D1_BRUSH_PROPERTIES, ID2D1RenderTarget};
@@ -19,14 +19,14 @@ use windows::Win32::Graphics::Gdi::{CreateRectRgn, HMONITOR, ValidateRect};
 use windows::Win32::UI::HiDpi::MDT_DEFAULT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW,
-    GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    HWND_TOP, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, PostQuitMessage, SET_WINDOW_POS_FLAGS,
+    DestroyWindow, GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow,
+    GetWindowLongPtrW, HWND_TOP, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, SET_WINDOW_POS_FLAGS,
     SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSENDCHANGING,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY,
-    WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WS_DISABLED,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    SetWindowPos, WM_CLOSE, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_NCDESTROY, WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+    WS_DISABLED, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -46,13 +46,16 @@ use crate::utils::{
     WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
     WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
     WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
-    get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
-    is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
-    loword, monitor_from_window, post_message_w,
+    get_dpi_for_monitor, get_window_rule, get_window_title, has_native_border, is_window,
+    is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible, loword,
+    monitor_from_window, post_message_w,
 };
 use crate::{APP_STATE, BG_SERVICES};
 
 const REORDER_TIMER_ID: usize = 0;
+const TIMER_INIT_ID: usize = 1;
+const TIMER_UNMINIMIZE_ID: usize = 2;
+const TIMER_UNMINIMIZE_SETTLE_ID: usize = 3;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum WindowState {
@@ -88,6 +91,9 @@ pub struct WindowBorder {
     is_debouncing_reorder: bool,
     consecutive_reorders: u64,
     arranged_override_active: bool, // radius override for arranged/snapped tracking window
+    pub is_raw_transferred: bool,
+    pub is_initialized: bool,
+    pub has_pending_location: bool,
 }
 
 impl WindowBorder {
@@ -110,6 +116,9 @@ impl WindowBorder {
             is_debouncing_reorder: false,
             consecutive_reorders: 0,
             arranged_override_active: false,
+            is_raw_transferred: false,
+            is_initialized: false,
+            has_pending_location: false,
         });
 
         this.create_window()
@@ -157,8 +166,24 @@ impl WindowBorder {
         self.load_from_config(window_rule, self.current_dpi)?;
 
         // Delay the border while the tracking window is in its creation animation
-        thread::sleep(time::Duration::from_millis(self.config.initialize_delay));
+        if self.config.initialize_delay > 0 {
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.border_window.0),
+                    TIMER_INIT_ID,
+                    self.config.initialize_delay as u32,
+                    None,
+                );
+            }
+        } else {
+            self.complete_init()?;
+            self.is_initialized = true;
+        }
 
+        Ok(())
+    }
+
+    pub fn complete_init(&mut self) -> anyhow::Result<()> {
         unsafe {
             // Make the window transparent (stole the code from PowerToys; dunno how it works).
             let pos: i32 = -GetSystemMetrics(SM_CXVIRTUALSCREEN) - 8;
@@ -177,6 +202,7 @@ impl WindowBorder {
             SetLayeredWindowAttributes(self.border_window.0, COLORREF(0x00000000), 255, LWA_ALPHA)
                 .context("could not set LWA_ALPHA")?;
 
+            self.update_window_rect().log_if_err();
             self.init_drawer()
                 .context("could not initialize border drawer in init()")?;
             self.init_border()
@@ -190,13 +216,6 @@ impl WindowBorder {
         self.update_color(Some(self.config.initialize_delay));
         self.update_window_rect().log_if_err();
         if self.should_show_border() {
-            self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
-            self.render().log_if_err();
-
-            // TODO: sometimes, the border doesn't show up on the first try. So, we just wait
-            // 5ms and call render() again. This seems to be an issue with the visibility of
-            // the window itself.
-            thread::sleep(time::Duration::from_millis(5));
             self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
             self.render().log_if_err();
 
@@ -244,6 +263,74 @@ impl WindowBorder {
         Ok(())
     }
 
+    pub fn complete_unminimize(&mut self) {
+        if self.should_show_border() {
+            self.update_color(Some(self.config.unminimize_delay));
+            self.update_window_rect().log_if_err();
+            if self.needs_renderer_resize().unwrap_or(false) {
+                self.resize_renderer().log_if_err();
+            }
+            self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
+            self.render().log_if_err();
+
+            self.drawer.set_anims_timer_if_needed(self.border_window.0);
+
+            // Arm trailing settle check (250ms) to ensure the border rect and surface
+            // match the final settled window geometry after Windows unminimize animations complete.
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.border_window.0),
+                    TIMER_UNMINIMIZE_SETTLE_ID,
+                    250,
+                    None,
+                );
+            }
+        }
+
+        self.is_paused = false;
+        self.has_pending_location = false;
+    }
+
+    pub fn handle_unminimize_settle(&mut self) {
+        if self.is_paused || !self.is_initialized {
+            return;
+        }
+        if !is_window_visible(self.tracking_window)
+            || is_window_cloaked(self.tracking_window)
+            || is_window_minimized(self.tracking_window)
+        {
+            return;
+        }
+
+        let new_monitor = monitor_from_window(self.tracking_window);
+        let mut needs_render = false;
+        if new_monitor != self.current_monitor {
+            self.current_monitor = new_monitor;
+            needs_render |= match self.rescale_border_and_resize_renderer_if_needed(new_monitor) {
+                Ok(is_updated) => is_updated,
+                Err(err) => {
+                    error!(
+                        "could not update appearance and renderer on unminimize settle: {err:#}"
+                    );
+                    return;
+                }
+            };
+        }
+
+        let prev_rect = self.window_rect;
+        self.update_window_rect().log_if_err();
+        if self.needs_renderer_resize().unwrap_or(false) {
+            self.resize_renderer().log_if_err();
+            needs_render = true;
+        }
+        needs_render |= !are_rects_same_size(&self.window_rect, &prev_rect);
+
+        self.update_position(None).log_if_err();
+        if needs_render {
+            self.render().log_if_err();
+        }
+    }
+
     pub fn load_from_config(&mut self, window_rule: WindowRule, dpi: u32) -> anyhow::Result<()> {
         let app_config = APP_STATE.config.read().unwrap();
         let is_initial_window = APP_STATE
@@ -273,31 +360,21 @@ impl WindowBorder {
         Ok(())
     }
 
-    // The V2 renderer uses DirectComposition which makes it easy to create a large persistent
-    // graphics buffer and let the compositor handle the positioning of the graphics content.
+    // The V2 renderer uses DirectComposition. We allocate a surface sized to the tracking
+    // window with 20% headroom quantized to 128px blocks. This reduces VRAM consumption by
+    // 85-95% while avoiding continuous GPU reallocations during live window dragging.
     fn calculate_target_v2_renderer_size(&self) -> WindowsCompatibleResult<D2D_SIZE_U> {
-        let monitor_info =
-            get_monitor_info(self.current_monitor).windows_context("could not get monitor info")?;
-        let monitor_width = monitor_info.rcMonitor.right - monitor_info.rcMonitor.left;
-        let monitor_height = monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top;
+        let window_width = (self.window_rect.right - self.window_rect.left).max(1);
+        let window_height = (self.window_rect.bottom - self.window_rect.top).max(1);
 
-        let stroke_width = self.drawer.stroke_width;
-        let border_offset = self.border_offset;
-        let border_padding = self.border_padding;
+        let target_w = (window_width as f32 * 1.2) as u32;
+        let target_h = (window_height as f32 * 1.2) as u32;
+        let quantized_w = (target_w.div_ceil(128) * 128).max(128);
+        let quantized_h = (target_h.div_ceil(128) * 128).max(128);
 
         Ok(D2D_SIZE_U {
-            width: (monitor_width as i32
-                + stroke_width * 2
-                + border_offset.left
-                + border_offset.right
-                + border_padding * 2)
-                .max(1) as u32,
-            height: (monitor_height as i32
-                + stroke_width * 2
-                + border_offset.top
-                + border_offset.bottom
-                + border_padding * 2)
-                .max(1) as u32, // size must be at least 1 otherwise resize/init renderer fails
+            width: quantized_w,
+            height: quantized_h,
         })
     }
 
@@ -343,7 +420,7 @@ impl WindowBorder {
                 self.raw_init_drawer()
             })
             .inspect_err(|err| {
-                if err.code() != T_E_REENTRANCY {
+                if err.code() != T_E_REENTRANCY && err.code() != T_E_UNINIT {
                     self.cleanup_and_queue_exit();
                 }
             })
@@ -454,7 +531,7 @@ impl WindowBorder {
                 ZOrderMode::BelowWindow => self.tracking_window,
             };
 
-            if let Err(e) = SetWindowPos(
+            let mut res = SetWindowPos(
                 self.border_window.0,
                 Some(hwndinsertafter),
                 self.window_rect.left,
@@ -462,8 +539,30 @@ impl WindowBorder {
                 self.window_rect.right - self.window_rect.left,
                 self.window_rect.bottom - self.window_rect.top,
                 swp_flags,
-            )
-            .context(format!(
+            );
+
+            // If SetWindowPos returned ERROR_ACCESS_DENIED (0x80070005),
+            // it is likely due to UIPI when inserting relative to an elevated or system window in Z-order.
+            // Retry positioning without modifying Z-order.
+            if let Err(ref e) = res
+                && e.code() == ERROR_ACCESS_DENIED.to_hresult()
+            {
+                debug!(
+                    "SetWindowPos returned Access Denied for {:?}; retrying with SWP_NOZORDER",
+                    self.tracking_window
+                );
+                res = SetWindowPos(
+                    self.border_window.0,
+                    None,
+                    self.window_rect.left,
+                    self.window_rect.top,
+                    self.window_rect.right - self.window_rect.left,
+                    self.window_rect.bottom - self.window_rect.top,
+                    swp_flags | SWP_NOZORDER,
+                );
+            }
+
+            if let Err(e) = res.context(format!(
                 "could not set window position for {:?}",
                 self.tracking_window
             )) {
@@ -608,11 +707,14 @@ impl WindowBorder {
     }
 
     fn raw_render(&mut self) -> WindowsCompatibleResult<()> {
-        // The legacy renderer's size requires an update everytime self.window_rect updates
-        if let RenderBackend::Legacy(ref backend) = self.drawer.render_backend {
+        // Ensure renderer capacity is sufficient before drawing
+        if self.needs_renderer_resize().unwrap_or(false) {
+            self.raw_resize_renderer()?;
+        } else if let RenderBackend::Legacy(ref backend) = self.drawer.render_backend {
             let renderer_size = self.calculate_target_legacy_renderer_size();
             backend.resize(renderer_size.width, renderer_size.height)?;
         }
+        self.drawer.fill_outer_corners = is_window_arranged(self.tracking_window);
         let bounds = self.compute_border_bounds();
 
         self.drawer.render(bounds, self.window_state)
@@ -625,7 +727,7 @@ impl WindowBorder {
                 self.raw_render()
             })
             .inspect_err(|err| {
-                if err.code() != T_E_REENTRANCY {
+                if err.code() != T_E_REENTRANCY && err.code() != T_E_UNINIT {
                     self.cleanup_and_queue_exit();
                 }
             })
@@ -648,16 +750,31 @@ impl WindowBorder {
     }
 
     fn needs_renderer_resize(&self) -> anyhow::Result<bool> {
-        let correct_renderer_size = self
-            .calculate_target_renderer_size()
-            .context("could not calculate target renderer size")?;
-        let actual_renderer_size = self
-            .drawer
-            .render_backend
-            .get_pixel_size()
-            .context("could not get actual renderer size")?;
+        match self.config.render_backend {
+            RenderBackendConfig::V2 => {
+                let actual_renderer_size = self
+                    .drawer
+                    .render_backend
+                    .get_pixel_size()
+                    .context("could not get actual renderer size")?;
+                let required_w = (self.window_rect.right - self.window_rect.left).max(1) as u32;
+                let required_h = (self.window_rect.bottom - self.window_rect.top).max(1) as u32;
 
-        Ok(correct_renderer_size != actual_renderer_size)
+                // Capacity-based: only reallocate if current surface capacity cannot contain the window
+                Ok(required_w > actual_renderer_size.width
+                    || required_h > actual_renderer_size.height)
+            }
+            RenderBackendConfig::Legacy => {
+                let correct_renderer_size = self.calculate_target_legacy_renderer_size();
+                let actual_renderer_size = self
+                    .drawer
+                    .render_backend
+                    .get_pixel_size()
+                    .context("could not get actual renderer size")?;
+
+                Ok(correct_renderer_size != actual_renderer_size)
+            }
+        }
     }
 
     fn raw_resize_renderer(&mut self) -> WindowsCompatibleResult<()> {
@@ -676,7 +793,7 @@ impl WindowBorder {
                 self.raw_resize_renderer()
             })
             .inspect_err(|err| {
-                if err.code() != T_E_REENTRANCY {
+                if err.code() != T_E_REENTRANCY && err.code() != T_E_UNINIT {
                     self.cleanup_and_queue_exit();
                 }
             })
@@ -754,10 +871,18 @@ impl WindowBorder {
         is_updated
     }
 
-    fn cleanup_and_queue_exit(&mut self) {
+    pub fn cleanup(&mut self) {
         self.is_paused = true;
         self.drawer.destroy_anims_timer();
-        unsafe { PostQuitMessage(0) };
+    }
+
+    fn cleanup_and_queue_exit(&mut self) {
+        self.cleanup();
+        if !self.border_window.0.is_invalid() {
+            post_message_w(Some(self.border_window.0), WM_CLOSE, WPARAM(0), LPARAM(0))
+                .context("cleanup_and_queue_exit")
+                .log_if_err();
+        }
     }
 
     /// # Safety
@@ -782,6 +907,28 @@ impl WindowBorder {
             unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, border_pointer as _) };
         }
 
+        if message == WM_NCDESTROY {
+            let raw_ptr =
+                unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) } as *mut WindowBorder;
+            if !raw_ptr.is_null() {
+                unsafe {
+                    if (*raw_ptr).is_raw_transferred {
+                        let mut border = Box::from_raw(raw_ptr);
+                        border.border_window.0 = HWND::default();
+                        border.cleanup();
+                        APP_STATE
+                            .borders
+                            .lock()
+                            .unwrap()
+                            .remove(&(border.tracking_window.0 as isize));
+                    } else {
+                        (*raw_ptr).cleanup();
+                    }
+                }
+            }
+            return unsafe { DefWindowProcW(window, message, wparam, lparam) };
+        }
+
         match !border_pointer.is_null() {
             true => unsafe { (*border_pointer).wnd_proc(window, message, wparam, lparam) },
             false => unsafe { DefWindowProcW(window, message, wparam, lparam) },
@@ -800,7 +947,8 @@ impl WindowBorder {
             WM_APP_LOCATIONCHANGE => {
                 // This is here to prevent LOCATIONCHANGE events from being handled before
                 // MINIMIZEEND or SHOW/UNCLOAKED events.
-                if self.is_paused {
+                if self.is_paused || !self.is_initialized {
+                    self.has_pending_location = true;
                     return LRESULT(0);
                 }
 
@@ -846,8 +994,18 @@ impl WindowBorder {
                     needs_render |= self.sync_border_radius();
                 }
 
+                let is_arranged = is_window_arranged(self.tracking_window);
+                if self.drawer.fill_outer_corners != is_arranged {
+                    self.drawer.fill_outer_corners = is_arranged;
+                    needs_render = true;
+                }
+
                 let prev_rect = self.window_rect;
                 self.update_window_rect().log_if_err();
+                if self.needs_renderer_resize().unwrap_or(false) {
+                    self.resize_renderer().log_if_err();
+                    needs_render = true;
+                }
                 needs_render |= !are_rects_same_size(&self.window_rect, &prev_rect);
 
                 let update_pos_flags =
@@ -865,6 +1023,10 @@ impl WindowBorder {
                 // First check if the tracking window still exists to avoid ghost borders
                 if !is_window(Some(self.tracking_window)) {
                     self.cleanup_and_queue_exit();
+                    return LRESULT(0);
+                }
+
+                if !self.is_initialized {
                     return LRESULT(0);
                 }
 
@@ -915,7 +1077,23 @@ impl WindowBorder {
             }
             WM_TIMER => {
                 // WPARAM contains the nIDEvent used in SetTimer
-                if wparam.0 == REORDER_TIMER_ID {
+                if wparam.0 == TIMER_INIT_ID {
+                    unsafe { KillTimer(Some(window), TIMER_INIT_ID) }.log_if_err();
+                    if let Err(err) = self.complete_init() {
+                        error!(
+                            "could not complete init for {:?}: {err:#}",
+                            self.tracking_window
+                        );
+                    } else {
+                        self.is_initialized = true;
+                    }
+                } else if wparam.0 == TIMER_UNMINIMIZE_ID {
+                    unsafe { KillTimer(Some(window), TIMER_UNMINIMIZE_ID) }.log_if_err();
+                    self.complete_unminimize();
+                } else if wparam.0 == TIMER_UNMINIMIZE_SETTLE_ID {
+                    unsafe { KillTimer(Some(window), TIMER_UNMINIMIZE_SETTLE_ID) }.log_if_err();
+                    self.handle_unminimize_settle();
+                } else if wparam.0 == REORDER_TIMER_ID {
                     unsafe { KillTimer(Some(window), REORDER_TIMER_ID) }.log_if_err();
                     self.is_debouncing_reorder = false;
                     self.consecutive_reorders = 0;
@@ -931,9 +1109,14 @@ impl WindowBorder {
                     return LRESULT(0);
                 }
 
+                if !self.is_initialized {
+                    return LRESULT(0);
+                }
+
                 self.update_color(None);
                 self.update_position(None).log_if_err();
                 self.render().log_if_err();
+                self.drawer.set_anims_timer_if_needed(self.border_window.0);
             }
             // EVENT_OBJECT_SHOW / EVENT_OBJECT_UNCLOAKED
             // NOTE: This message can still be sent while the window is minimized.
@@ -942,6 +1125,10 @@ impl WindowBorder {
                     || is_window_cloaked(self.tracking_window)
                     || is_window_minimized(self.tracking_window)
                 {
+                    return LRESULT(0);
+                }
+
+                if !self.is_initialized {
                     return LRESULT(0);
                 }
 
@@ -966,9 +1153,11 @@ impl WindowBorder {
             WM_APP_MINIMIZESTART => {
                 self.update_position(Some(SWP_HIDEWINDOW)).log_if_err();
 
-                // Needed for the fade animation to work correctly when window is unminimized
-                self.drawer.active_color.set_opacity(0.0).log_if_err();
-                self.drawer.inactive_color.set_opacity(0.0).log_if_err();
+                if self.is_initialized {
+                    // Needed for the fade animation to work correctly when window is unminimized
+                    self.drawer.active_color.set_opacity(0.0).log_if_err();
+                    self.drawer.inactive_color.set_opacity(0.0).log_if_err();
+                }
 
                 self.drawer.destroy_anims_timer();
                 self.is_paused = true;
@@ -982,25 +1171,25 @@ impl WindowBorder {
                     return LRESULT(0);
                 }
 
-                // Keep the border hidden while the tracking window is in its unminimize animation
-                thread::sleep(time::Duration::from_millis(self.config.unminimize_delay));
-
-                if self.should_show_border() {
-                    self.update_color(Some(self.config.unminimize_delay));
-                    self.update_window_rect().log_if_err();
-                    self.update_position(Some(SWP_SHOWWINDOW)).log_if_err();
-                    self.render().log_if_err();
-
-                    self.drawer.set_anims_timer_if_needed(self.border_window.0);
+                if self.config.unminimize_delay > 0 {
+                    unsafe {
+                        let _ = SetTimer(
+                            Some(self.border_window.0),
+                            TIMER_UNMINIMIZE_ID,
+                            self.config.unminimize_delay as u32,
+                            None,
+                        );
+                    }
+                } else {
+                    self.complete_unminimize();
                 }
-
-                self.is_paused = false;
             }
             WM_APP_ANIMATE => {
-                if self.is_paused {
+                if self.is_paused || !self.is_initialized {
                     return LRESULT(0);
                 }
 
+                self.drawer.fill_outer_corners = is_window_arranged(self.tracking_window);
                 let bounds = self.compute_border_bounds();
                 self.drawer.animate(bounds, self.window_state).log_if_err();
             }
@@ -1120,11 +1309,9 @@ impl WindowBorder {
             WM_PAINT => {
                 let _ = unsafe { ValidateRect(Some(window), None) };
             }
-            WM_NCDESTROY => {
-                // We'll set GWLP_USERDATA to 0 so that the window procedure can't find the
-                // border's pointer anymore, making it stop processing our custom messages.
-                unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
-                self.cleanup_and_queue_exit();
+            WM_CLOSE => {
+                let _ = unsafe { DestroyWindow(window) };
+                return LRESULT(0);
             }
             // This message is sent when a display setting has changed (e.g. resolution change). It
             // is not sent when the window moves to a different monitor.

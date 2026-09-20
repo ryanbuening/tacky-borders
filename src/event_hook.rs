@@ -62,9 +62,13 @@ pub extern "system" fn process_win_event(
         // accurate 100% of the time. I tried finding workarounds without polling, but gave up.
         EVENT_SYSTEM_FOREGROUND => {
             let potential_active_hwnd = get_foreground_window();
+            let new_active_hwnd = match !potential_active_hwnd.is_invalid() {
+                true => potential_active_hwnd,
+                false => _hwnd,
+            };
+            let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
 
-            // Immediately try these HWNDs, and if they're wrong, hope that polling works.
-            handle_foreground_event(potential_active_hwnd, _hwnd);
+            handle_foreground_event(new_active_hwnd, old_active_hwnd);
         }
         EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
             if _id_object == OBJID_WINDOW.0 {
@@ -90,32 +94,36 @@ pub extern "system" fn process_win_event(
                     .log_if_err();
             }
         }
-        EVENT_OBJECT_DESTROY => {
-            if _id_object == OBJID_WINDOW.0 && _id_child == CHILDID_SELF as i32 {
-                destroy_border_for_window(_hwnd);
-            }
+        EVENT_OBJECT_DESTROY
+            if _id_object == OBJID_WINDOW.0 && _id_child == CHILDID_SELF as i32 =>
+        {
+            destroy_border_for_window(_hwnd);
         }
         _ => {}
     }
 }
 
-pub fn handle_foreground_event(best_hwnd_guess: HWND, other_hwnd_guess: HWND) {
-    let new_active_hwnd = match !best_hwnd_guess.is_invalid() {
-        true => best_hwnd_guess,
-        false => other_hwnd_guess,
-    };
+pub fn handle_foreground_event(new_active_hwnd: HWND, old_active_hwnd: HWND) {
+    if new_active_hwnd == old_active_hwnd {
+        return;
+    }
     *APP_STATE.active_window.lock().unwrap() = new_active_hwnd.0 as isize;
 
-    // Send foreground messages to all the border windows
-    // TODO: I think only the previous focused and new focused actually need the message
-    for (key, val) in APP_STATE.borders.lock().unwrap().iter() {
-        let border_window = HWND(*val as _);
-        // Some apps can become foreground even if they're not visible, so we also have to check
-        // the keys against the active_window HWND from earlier
-        if is_window_visible(border_window) || *key == new_active_hwnd.0 as isize {
-            post_message_w(Some(border_window), WM_APP_FOREGROUND, WPARAM(0), LPARAM(0))
-                .context("EVENT_OBJECT_FOCUS")
-                .log_if_err();
-        }
+    let borders = APP_STATE.borders.lock().unwrap();
+
+    // Only notify previously active window (to switch to Inactive)
+    if let Some(&old_border) = borders.get(&(old_active_hwnd.0 as isize)) {
+        let border_window = HWND(old_border as _);
+        post_message_w(Some(border_window), WM_APP_FOREGROUND, WPARAM(0), LPARAM(0))
+            .context("EVENT_OBJECT_FOCUS old active")
+            .log_if_err();
+    }
+
+    // Only notify newly active window (to switch to Active)
+    if let Some(&new_border) = borders.get(&(new_active_hwnd.0 as isize)) {
+        let border_window = HWND(new_border as _);
+        post_message_w(Some(border_window), WM_APP_FOREGROUND, WPARAM(0), LPARAM(0))
+            .context("EVENT_OBJECT_FOCUS new active")
+            .log_if_err();
     }
 }

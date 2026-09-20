@@ -1,23 +1,28 @@
 use anyhow::Context;
+use log::error;
+use std::cell::RefCell;
 use std::time;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D_RECT_F, D2D_SIZE_F, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Brush,
-    ID2D1Multithread, ID2D1RenderTarget,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Brush, ID2D1Factory1,
+    ID2D1PathGeometry, ID2D1RenderTarget,
 };
-use windows::Win32::Graphics::Dxgi::IDXGISurface;
-use windows::core::Interface;
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::APP_STATE;
 use crate::animations::{AnimType, Animations};
 use crate::border_config::BorderConfig;
 use crate::colors::ColorBrush;
 use crate::effects::Effects;
-use crate::render_backend::{RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS};
+use crate::render_backend::{
+    D2DDeviceContextDrawGuard, D2DHwndRenderTargetDrawGuard, D2DMultithreadGuard,
+    DCompSurfaceDrawGuard, RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS,
+};
 use crate::utils::{
     StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, WriteLockable,
@@ -37,6 +42,8 @@ pub struct BorderDrawer {
     pub effects: Effects,
     pub last_render_time: Option<time::Instant>,
     pub last_anim_time: Option<time::Instant>,
+    pub fill_outer_corners: bool,
+    corner_caps: RefCell<Option<(D2D_RECT_F, f32, f32, ID2D1PathGeometry)>>,
 }
 
 impl BorderDrawer {
@@ -186,7 +193,7 @@ impl BorderDrawer {
                 WindowState::Inactive => (&self.active_color, &self.inactive_color),
             };
 
-            render_target.BeginDraw();
+            let draw_guard = D2DHwndRenderTargetDrawGuard::begin(render_target);
             render_target.Clear(None);
 
             if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
@@ -196,7 +203,7 @@ impl BorderDrawer {
 
                 match bottom_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
+                        self.draw_rectangle(&stroke_rect, &bounds, render_target, id2d1_brush)
                     }
                     None => debug!("ID2D1Brush for bottom_color has not been created yet"),
                 }
@@ -208,13 +215,13 @@ impl BorderDrawer {
 
                 match top_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, render_target, id2d1_brush)
+                        self.draw_rectangle(&stroke_rect, &bounds, render_target, id2d1_brush)
                     }
                     None => debug!("ID2D1Brush for top_color has not been created yet"),
                 }
             }
 
-            render_target.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         Ok(())
@@ -243,29 +250,19 @@ impl BorderDrawer {
                 WindowState::Inactive => (&self.active_color, &self.inactive_color),
             };
 
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let mut point = Default::default();
+            let (surface_draw_guard, dxgi_surface) =
+                DCompSurfaceDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
             d2d_context.SetTarget(&target_bitmap);
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
@@ -275,7 +272,7 @@ impl BorderDrawer {
 
                 match bottom_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
+                        self.draw_rectangle(&stroke_rect, &bounds, d2d_context, id2d1_brush)
                     }
                     None => debug!("ID2D1Brush for bottom_color has not been created yet"),
                 }
@@ -287,25 +284,20 @@ impl BorderDrawer {
 
                 match top_color.get_brush() {
                     Some(id2d1_brush) => {
-                        self.draw_rectangle(&stroke_rect, d2d_context, id2d1_brush)
+                        self.draw_rectangle(&stroke_rect, &bounds, d2d_context, id2d1_brush)
                     }
                     None => debug!("ID2D1Brush for top_color has not been created yet"),
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
+            surface_draw_guard.finish()?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
 
         Ok(())
@@ -339,8 +331,16 @@ impl BorderDrawer {
             // Create a rect that covers up to the outer edge of the border
             let border_outer_rect = D2D1_ROUNDED_RECT {
                 rect: bounds,
-                radiusX: stroke_rect.radiusX + half_stroke_width,
-                radiusY: stroke_rect.radiusY + half_stroke_width,
+                radiusX: if self.fill_outer_corners {
+                    0.0
+                } else {
+                    stroke_rect.radiusX + half_stroke_width
+                },
+                radiusY: if self.fill_outer_corners {
+                    0.0
+                } else {
+                    stroke_rect.radiusY + half_stroke_width
+                },
             };
 
             // Set the d2d_context target to the border_bitmap
@@ -352,7 +352,7 @@ impl BorderDrawer {
             d2d_context.SetTarget(border_bitmap);
 
             // Draw to the border_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             // We use filled rectangles here because it helps make the effects more visible.
@@ -383,7 +383,7 @@ impl BorderDrawer {
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         unsafe {
@@ -419,31 +419,21 @@ impl BorderDrawer {
                 None,
             )?;
 
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             self.fill_rectangle(&border_inner_rect, d2d_context, &opaque_brush);
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
         }
 
         unsafe {
-            // We're about to use DirectComposition which means we will be using the underlying
-            // Direct3D objects without Direct2D's knowledge. To avoid resource access conflict, we
-            // must explicitly acquire a lock. Read the following article for more info:
-            // https://learn.microsoft.com/en-us/windows/win32/direct2d/multi-threaded-direct2d-apps
-            let d2d_multithread: ID2D1Multithread = APP_STATE
-                .render_factory
-                .cast()
-                .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _d2d_multithread_guard = D2DMultithreadGuard::enter()?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
-            let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let mut point = Default::default();
+            let (surface_draw_guard, dxgi_surface) =
+                DCompSurfaceDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
@@ -456,7 +446,7 @@ impl BorderDrawer {
                 .to_windows_result(T_E_UNINIT)?;
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let draw_guard = D2DDeviceContextDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             d2d_context.DrawImage(
@@ -467,19 +457,15 @@ impl BorderDrawer {
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
 
-            d2d_context.EndDraw(None, None)?;
+            draw_guard.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
-                .windows_context("d_comp_surface.EndDraw()")?;
+            surface_draw_guard.finish()?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
 
-            d2d_multithread.Leave();
+            drop(_d2d_multithread_guard);
         }
 
         Ok(())
@@ -489,6 +475,7 @@ impl BorderDrawer {
     fn draw_rectangle(
         &self,
         stroke_rect: &D2D1_ROUNDED_RECT,
+        bounds: &D2D_RECT_F,
         renderer: &ID2D1RenderTarget,
         brush: &ID2D1Brush,
     ) {
@@ -497,14 +484,65 @@ impl BorderDrawer {
                 0.0 => {
                     renderer.DrawRectangle(&stroke_rect.rect, brush, self.stroke_width as f32, None)
                 }
-                _ => renderer.DrawRoundedRectangle(
-                    stroke_rect,
-                    brush,
-                    self.stroke_width as f32,
-                    None,
-                ),
+                _ => {
+                    renderer.DrawRoundedRectangle(
+                        stroke_rect,
+                        brush,
+                        self.stroke_width as f32,
+                        None,
+                    );
+                    if self.fill_outer_corners
+                        && let Some(caps) = self.get_corner_caps(bounds, stroke_rect)
+                    {
+                        renderer.FillGeometry(&caps, brush, None);
+                    }
+                }
             }
         }
+    }
+
+    fn get_corner_caps(
+        &self,
+        bounds: &D2D_RECT_F,
+        stroke_rect: &D2D1_ROUNDED_RECT,
+    ) -> Option<ID2D1PathGeometry> {
+        let radius = stroke_rect.radiusX;
+        let stroke_width = self.stroke_width as f32;
+        if radius <= 0.0 || stroke_width <= 0.0 {
+            return None;
+        }
+
+        let mut caps = self.corner_caps.borrow_mut();
+        let needs_recreate = match *caps {
+            Some((ref b, r, sw, _)) => {
+                b.left != bounds.left
+                    || b.top != bounds.top
+                    || b.right != bounds.right
+                    || b.bottom != bounds.bottom
+                    || r != radius
+                    || sw != stroke_width
+            }
+            None => true,
+        };
+
+        if needs_recreate {
+            match create_corner_caps_geometry(
+                &APP_STATE.render_factory,
+                bounds,
+                radius,
+                stroke_width,
+            ) {
+                Ok(geom) => {
+                    *caps = Some((*bounds, radius, stroke_width, geom));
+                }
+                Err(err) => {
+                    error!("could not create corner caps geometry: {err:#}");
+                    return None;
+                }
+            }
+        }
+
+        caps.as_ref().map(|(_, _, _, geom)| geom.clone())
     }
 
     // NOTE: ID2D1DeviceContext implements From<&ID2D1DeviceContext> for &ID2D1RenderTarget
@@ -543,7 +581,8 @@ impl BorderDrawer {
 
         let mut update = false;
 
-        for anim_params in self.animations.get_current(window_state).clone().iter() {
+        let current_anims = self.animations.get_current(window_state).clone();
+        for anim_params in current_anims.iter() {
             match anim_params.anim_type {
                 AnimType::Spiral | AnimType::ReverseSpiral => {
                     self.animations.animate_spiral(
@@ -586,6 +625,147 @@ impl BorderDrawer {
             self.render(bounds, window_state)?;
         }
 
+        // Halt animation timer when no continuous animations exist and Fade has finished
+        let has_continuous = current_anims
+            .iter()
+            .any(|p| matches!(p.anim_type, AnimType::Spiral | AnimType::ReverseSpiral));
+        if !has_continuous {
+            let correct_active_opacity = if window_state == WindowState::Active {
+                1.0
+            } else {
+                0.0
+            };
+            let fade_done = (self.active_color.get_opacity()? - correct_active_opacity).abs()
+                < 0.001
+                && (self.inactive_color.get_opacity()? - (1.0 - correct_active_opacity)).abs()
+                    < 0.001;
+            if fade_done {
+                self.destroy_anims_timer();
+            }
+        }
+
         Ok(())
+    }
+}
+
+fn create_corner_caps_geometry(
+    factory: &ID2D1Factory1,
+    bounds: &D2D_RECT_F,
+    radius: f32,
+    stroke_width: f32,
+) -> windows::core::Result<ID2D1PathGeometry> {
+    unsafe {
+        let path_geometry = factory.CreatePathGeometry()?;
+        let sink = path_geometry.Open()?;
+
+        let r_outer = (radius + stroke_width / 2.0)
+            .min((bounds.right - bounds.left) / 2.0)
+            .min((bounds.bottom - bounds.top) / 2.0);
+
+        if r_outer > 0.0 {
+            let arc_size = D2D_SIZE_F {
+                width: r_outer,
+                height: r_outer,
+            };
+
+            // Top-left corner cap
+            sink.BeginFigure(
+                Vector2 {
+                    X: bounds.left,
+                    Y: bounds.top,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(Vector2 {
+                X: bounds.left,
+                Y: bounds.top + r_outer,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 {
+                    X: bounds.left + r_outer,
+                    Y: bounds.top,
+                },
+                size: arc_size,
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+
+            // Top-right corner cap
+            sink.BeginFigure(
+                Vector2 {
+                    X: bounds.right,
+                    Y: bounds.top,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(Vector2 {
+                X: bounds.right - r_outer,
+                Y: bounds.top,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 {
+                    X: bounds.right,
+                    Y: bounds.top + r_outer,
+                },
+                size: arc_size,
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+
+            // Bottom-right corner cap
+            sink.BeginFigure(
+                Vector2 {
+                    X: bounds.right,
+                    Y: bounds.bottom,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(Vector2 {
+                X: bounds.right,
+                Y: bounds.bottom - r_outer,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 {
+                    X: bounds.right - r_outer,
+                    Y: bounds.bottom,
+                },
+                size: arc_size,
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+
+            // Bottom-left corner cap
+            sink.BeginFigure(
+                Vector2 {
+                    X: bounds.left,
+                    Y: bounds.bottom,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(Vector2 {
+                X: bounds.left + r_outer,
+                Y: bounds.bottom,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: Vector2 {
+                    X: bounds.left,
+                    Y: bounds.bottom - r_outer,
+                },
+                size: arc_size,
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+
+        sink.Close()?;
+        Ok(path_geometry.into())
     }
 }
