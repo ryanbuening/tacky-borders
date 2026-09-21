@@ -30,10 +30,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
-    RealGetWindowClassW, SendMessageW, SendNotifyMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, GetForegroundWindow, GetWindow,
+    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
+    IsWindowVisible, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
@@ -493,6 +494,13 @@ pub fn has_filtered_style(hwnd: HWND) -> bool {
     ex_style.contains(WS_EX_TOOLWINDOW) || ex_style.contains(WS_EX_NOACTIVATE)
 }
 
+pub fn has_owner(hwnd: HWND) -> bool {
+    match unsafe { GetWindow(hwnd, GW_OWNER) } {
+        Ok(owner) => !owner.is_invalid() && !owner.0.is_null(),
+        Err(_) => false,
+    }
+}
+
 pub fn get_window_title(hwnd: HWND) -> anyhow::Result<String> {
     let mut title_buf: [u16; 256] = [0; 256];
 
@@ -880,7 +888,9 @@ pub fn show_border_for_window(hwnd: HWND) {
 
         if window_rule.enabled == Some(EnableMode::Bool(false)) {
             debug!("border is disabled for {hwnd:?}");
-        } else if window_rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(hwnd) {
+        } else if window_rule.enabled == Some(EnableMode::Bool(true))
+            || (!has_filtered_style(hwnd) && !has_owner(hwnd))
+        {
             create_border_for_window(hwnd, window_rule);
         }
     }
@@ -1052,7 +1062,7 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
-    use windows::Win32::UI::WindowsAndMessaging::CreateWindowExW;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_POPUP};
     use windows::core::w;
 
     #[test]
@@ -1095,6 +1105,47 @@ mod tests {
 
         assert!((0.07..=0.08).contains(&y_coord_0_2));
         assert!((0.499..=0.501).contains(&y_coord_0_5));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_owner() -> anyhow::Result<()> {
+        let parent = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("Parent Window"),
+                Default::default(),
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        assert!(!has_owner(parent.0));
+
+        let owned = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("Owned Popup"),
+                WS_POPUP,
+                0,
+                0,
+                50,
+                50,
+                Some(parent.0),
+                None,
+                None,
+                None,
+            )
+        }?);
+        assert!(has_owner(owned.0));
 
         Ok(())
     }

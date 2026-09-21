@@ -34,8 +34,8 @@ use theme::ThemeWatcher;
 use utils::{
     LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WM_APP_RECREATE_DRAWER,
     WindowsCompatibleResult, WindowsContext, can_access_window, create_border_for_window,
-    get_foreground_window, get_last_error, get_window_rule, has_filtered_style, is_window_cloaked,
-    is_window_top_level, is_window_visible, post_message_w,
+    get_foreground_window, get_last_error, get_window_rule, has_filtered_style, has_owner,
+    is_window_cloaked, is_window_top_level, is_window_visible, post_message_w,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
@@ -717,7 +717,7 @@ unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) 
             if window_rule.enabled == Some(EnableMode::Bool(false)) {
                 info!("border is disabled for {_hwnd:?}");
             } else if window_rule.enabled == Some(EnableMode::Bool(true))
-                || !has_filtered_style(_hwnd)
+                || (!has_filtered_style(_hwnd) && !has_owner(_hwnd))
             {
                 create_border_for_window(_hwnd, window_rule);
             }
