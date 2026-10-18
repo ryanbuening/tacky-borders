@@ -33,8 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, GetForegroundWindow, GetWindow,
     GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
     IsWindowVisible, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
@@ -489,9 +489,16 @@ pub fn is_window_top_level(hwnd: HWND) -> bool {
 }
 
 pub fn has_filtered_style(hwnd: HWND) -> bool {
+    let style = get_window_style(hwnd);
     let ex_style = get_window_ex_style(hwnd);
 
-    ex_style.contains(WS_EX_TOOLWINDOW) || ex_style.contains(WS_EX_NOACTIVATE)
+    let is_frameless_popup = (style.contains(WS_POPUP) || ex_style.contains(WS_EX_LAYERED))
+        && !style.contains(WS_THICKFRAME)
+        && !ex_style.contains(WS_EX_WINDOWEDGE);
+
+    ex_style.contains(WS_EX_TOOLWINDOW)
+        || ex_style.contains(WS_EX_NOACTIVATE)
+        || is_frameless_popup
 }
 
 pub fn has_owner(hwnd: HWND) -> bool {
@@ -1062,7 +1069,7 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_MOD_NOT_FOUND;
-    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_POPUP};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_OVERLAPPEDWINDOW, WS_POPUP};
     use windows::core::w;
 
     #[test]
@@ -1146,6 +1153,65 @@ mod tests {
             )
         }?);
         assert!(has_owner(owned.0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_filtered_style() -> anyhow::Result<()> {
+        let standard_window = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("Standard Window"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        assert!(!has_filtered_style(standard_window.0));
+
+        let borderless_resizable = OwnedHWND(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("Borderless Resizable"),
+                WS_POPUP | WS_THICKFRAME,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        assert!(!has_filtered_style(borderless_resizable.0));
+
+        let frameless_popup = OwnedHWND(unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED,
+                w!("STATIC"),
+                w!("Frameless Popup"),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        assert!(has_filtered_style(frameless_popup.0));
 
         Ok(())
     }
